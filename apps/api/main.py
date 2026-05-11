@@ -20,12 +20,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.config import get_api_settings
 from apps.api.logging import configure_logging
-from apps.api.routes import candles, context, health, signals
+from apps.api.routes import candles, chart, context, health, signals
+from apps.api.routes import bootstrap as bootstrap_route
 from apps.api.websockets.feeds import router as ws_router
 from apps.api.state import AppState
 from packages.core.models import Tick as TickModel
 from packages.db.session import init_db
 from packages.messaging.bus import Event, EventType, get_bus
+from runtime.bootstrap import BootstrapService
+from runtime.bootstrap.config import BootstrapSettings
 from runtime.candle_engine import CandleEngine
 from runtime.context_engine import ContextEngine
 from runtime.execution_engine import ExecutionEngine
@@ -51,13 +54,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     bus = get_bus()
     state = AppState.get()
 
+    bootstrap_settings = BootstrapSettings()
+
     candle_engine = CandleEngine(bus)
     indicator_engine = IndicatorEngine(bus)
     context_engine = ContextEngine(bus)
-    strategy_engine = StrategyEngine(bus)
+    strategy_engine = StrategyEngine(
+        bus,
+        suppress_historical=bootstrap_settings.suppress_historical_signals,
+    )
     risk_engine = RiskEngine(bus)
     execution_engine = ExecutionEngine(bus, paper=True)
     _recorder = EventRecorder(bus)  # noqa: F841 — subscribes itself
+
+    bootstrap_svc = BootstrapService(bus, candle_engine, bootstrap_settings)
 
     state.candle_engine = candle_engine
     state.indicator_engine = indicator_engine
@@ -66,12 +76,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.risk_engine = risk_engine
     state.execution_engine = execution_engine
     state.bus = bus
+    state.bootstrap_status = bootstrap_svc.status
 
     for symbol in settings.symbols:
         candle_engine.register_symbol(symbol)
         indicator_engine.register_symbol(symbol)
         context_engine.register_symbol(symbol)
         strategy_engine.register(VWAPReclaimLong(symbol=symbol))
+        bootstrap_svc.register_symbol(symbol)
 
     adapter = IBKRAdapter()
 
@@ -84,12 +96,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     adapter.on_tick(on_tick)
     state.adapter = adapter
 
-    try:
-        await adapter.connect()
+    # connect() is non-blocking: tries once, schedules background retries on failure
+    await adapter.connect()
+
+    if adapter.is_connected:
+        # ---- historical bootstrap (before live streaming) ----
+        logger.info("api.bootstrap_starting")
+        await bootstrap_svc.run(adapter._ib)  # type: ignore[attr-defined]
+        logger.info("api.bootstrap_done", bars=state.bootstrap_status.bars_loaded)
+
+        # ---- subscribe to live real-time bars ----
         for symbol in settings.symbols:
             await adapter.subscribe(symbol)
-    except Exception:
-        logger.warning("api.ibkr_connect_failed", exc_info=True)
+    else:
+        logger.warning(
+            "api.ibkr_unavailable",
+            note="Live data disabled. Start TWS/Gateway to enable. Replay and REST still work.",
+        )
 
     logger.info("api.ready")
 
@@ -119,6 +142,8 @@ app.include_router(health.router)
 app.include_router(candles.router)
 app.include_router(signals.router)
 app.include_router(context.router)
+app.include_router(chart.router)
+app.include_router(bootstrap_route.router)
 app.include_router(ws_router)
 
 

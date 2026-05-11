@@ -60,8 +60,8 @@ async def _setup_bus_handlers() -> None:
         await _candle_bcast.broadcast(
             {
                 "type": "candle",
-                "symbol": c.symbol,
-                "timeframe": c.timeframe,
+                "symbol": str(c.symbol),
+                "timeframe": str(c.timeframe),
                 "timestamp": c.timestamp.isoformat(),
                 "open": c.open,
                 "high": c.high,

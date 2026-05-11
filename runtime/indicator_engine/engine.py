@@ -39,6 +39,10 @@ _OR_END_HOUR, _OR_END_MINUTE = 10, 0
 _VOLUME_LOOKBACK = 20  # periods for rolling avg
 
 
+_EMA_9_K = 2.0 / (9 + 1)    # smoothing factor for 9-period EMA
+_EMA_21_K = 2.0 / (21 + 1)  # smoothing factor for 21-period EMA
+
+
 class _SymbolState:
     """Mutable per-symbol indicator state updated on each 1m candle."""
 
@@ -63,6 +67,10 @@ class _SymbolState:
         # Volume rolling window
         self._volume_window: deque[float] = deque(maxlen=_VOLUME_LOOKBACK)
 
+        # EMAs — reset each calendar day, seeded on the first bar of the day
+        self.ema_9: Optional[float] = None
+        self.ema_21: Optional[float] = None
+
         # Session tracking for resets
         self._last_session: Optional[SessionType] = None
         self._last_date: Optional[str] = None  # YYYY-MM-DD in ET
@@ -83,6 +91,9 @@ class _SymbolState:
             self.or_locked = False
             self.premarket_high = None
             self.premarket_low = None
+            # Reset EMAs so each day's EMA is anchored to that day's open
+            self.ema_9 = None
+            self.ema_21 = None
             logger.debug("indicator_engine.day_rollover", symbol=self.symbol, date=date_str)
 
         self._last_date = date_str
@@ -126,6 +137,18 @@ class _SymbolState:
                         else min(self.or_low, candle.low)
                     )
 
+        # --- EMAs (close-based, seeded on first bar of the day) ---
+        close = candle.close
+        if self.ema_9 is None:
+            self.ema_9 = close
+        else:
+            self.ema_9 = close * _EMA_9_K + self.ema_9 * (1.0 - _EMA_9_K)
+
+        if self.ema_21 is None:
+            self.ema_21 = close
+        else:
+            self.ema_21 = close * _EMA_21_K + self.ema_21 * (1.0 - _EMA_21_K)
+
         # --- Volume rolling average ---
         self._volume_window.append(candle.volume)
         rolling_avg = (
@@ -162,6 +185,8 @@ class _SymbolState:
             prior_day_low=self.prior_day_low,
             premarket_high=self.premarket_high,
             premarket_low=self.premarket_low,
+            ema_9=self.ema_9,
+            ema_21=self.ema_21,
         )
 
 

@@ -18,6 +18,7 @@ from packages.core.models import (
     MarketContext,
     OrderResult,
     SetupSignal,
+    candle_stable_id,
 )
 from packages.db.session import get_session
 from packages.db.orm_models import (
@@ -52,10 +53,12 @@ class EventRecorder:
 
     async def _on_candle(self, event: Event) -> None:
         candle: Candle = event.payload
+        # Use deterministic ID so re-loading the same bar is an upsert, not duplicate
+        stable = candle_stable_id(candle.symbol, candle.timeframe, candle.timestamp)
         orm = CandleORM(
-            id=candle.id,
+            id=stable,
             symbol=candle.symbol,
-            timeframe=candle.timeframe,
+            timeframe=candle.timeframe.value,
             timestamp=candle.timestamp,
             open=candle.open,
             high=candle.high,
@@ -65,17 +68,17 @@ class EventRecorder:
             vwap=candle.vwap,
             cumulative_volume=candle.cumulative_volume,
             cumulative_turnover=candle.cumulative_turnover,
-            session=candle.session,
+            session=candle.session.value,
             is_partial=candle.is_partial,
         )
-        await self._upsert(orm, "candle", candle.id)
+        await self._upsert(orm, "candle", stable)
 
     async def _on_indicators(self, event: Event) -> None:
         snap: IndicatorSnapshot = event.payload
         orm = IndicatorSnapshotORM(
             id=snap.id,
             symbol=snap.symbol,
-            timeframe=snap.timeframe,
+            timeframe=snap.timeframe.value,
             timestamp=snap.timestamp,
             vwap=snap.vwap,
             vwap_distance_pct=snap.vwap_distance_pct,
@@ -88,6 +91,8 @@ class EventRecorder:
             prior_day_low=snap.prior_day_low,
             premarket_high=snap.premarket_high,
             premarket_low=snap.premarket_low,
+            ema_9=snap.ema_9,
+            ema_21=snap.ema_21,
         )
         await self._upsert(orm, "indicator", snap.id)
 
@@ -108,7 +113,7 @@ class EventRecorder:
             lower_lows=ctx.lower_lows,
             opening_drive_up=ctx.opening_drive_up,
             opening_drive_down=ctx.opening_drive_down,
-            session=ctx.session,
+            session=ctx.session.value,
         )
         await self._upsert(orm, "context", ctx.id)
 

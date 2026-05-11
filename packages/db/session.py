@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy import text
 from sqlalchemy.orm import DeclarativeBase
 
 from packages.db.config import get_db_settings
@@ -71,3 +72,11 @@ async def init_db() -> None:
 
     async with engine().begin() as conn:
         await conn.run_sync(ORMBase.metadata.create_all)
+        # Lightweight, idempotent dev bootstrap for newly added columns.
+        # Proper production migration flow should be Alembic.
+        await conn.execute(
+            text("ALTER TABLE indicators ADD COLUMN IF NOT EXISTS ema_9 DOUBLE PRECISION")
+        )
+        await conn.execute(
+            text("ALTER TABLE indicators ADD COLUMN IF NOT EXISTS ema_21 DOUBLE PRECISION")
+        )

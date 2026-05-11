@@ -13,6 +13,7 @@ from packages.core.models import (
     SignalStatus,
     Tick,
     Timeframe,
+    candle_stable_id,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "SignalStatus",
     "Tick",
     "Timeframe",
+    "candle_stable_id",
 ]

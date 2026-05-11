@@ -70,10 +70,6 @@ async def test_partial_candle_emitted_on_each_tick() -> None:
     engine = CandleEngine(bus)
     engine.register_symbol("QQQ")
 
-    partials: list = []
-    bus.subscribe(EventType.CANDLE_PARTIAL, lambda e: partials.append(e.payload) or asyncio.coroutine(lambda: None)())
-
-    # Simpler approach
     partial_events: list = []
 
     async def capture(event):
@@ -84,8 +80,8 @@ async def test_partial_candle_emitted_on_each_tick() -> None:
     tick = make_tick(ts="2024-01-15T14:30:05+00:00")
     await engine.on_tick(tick)
 
-    # 2 timeframes (1m, 5m) × 1 tick = 2 partial events
-    assert len(partial_events) == 2
+    # 3 timeframes (1m, 5m, 1h) × 1 tick = 3 partial events
+    assert len(partial_events) == 3
 
 
 @pytest.mark.asyncio

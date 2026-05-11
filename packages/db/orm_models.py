@@ -68,6 +68,8 @@ class IndicatorSnapshotORM(Base):
     prior_day_low: Mapped[float | None] = mapped_column(Float)
     premarket_high: Mapped[float | None] = mapped_column(Float)
     premarket_low: Mapped[float | None] = mapped_column(Float)
+    ema_9: Mapped[float | None] = mapped_column(Float)
+    ema_21: Mapped[float | None] = mapped_column(Float)
 
     __table_args__ = (
         Index("ix_indicators_symbol_ts", "symbol", "timestamp"),

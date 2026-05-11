@@ -10,6 +10,7 @@ from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from packages.messaging.bus import EventBus
+    from runtime.bootstrap import BootstrapStatus
     from runtime.candle_engine import CandleEngine
     from runtime.context_engine import ContextEngine
     from runtime.execution_engine import ExecutionEngine
@@ -31,6 +32,7 @@ class AppState:
         self.strategy_engine: Optional["StrategyEngine"] = None
         self.risk_engine: Optional["RiskEngine"] = None
         self.execution_engine: Optional["ExecutionEngine"] = None
+        self.bootstrap_status: Optional["BootstrapStatus"] = None
 
     @classmethod
     def get(cls) -> "AppState":

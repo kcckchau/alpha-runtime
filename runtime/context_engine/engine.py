@@ -135,6 +135,7 @@ class _SymbolContext:
             opening_drive_down=self._opening_drive_down,
             session=candle.session,
             indicators=indicators,
+            historical=candle.historical,
         )
 
     def _detect_structure(self) -> tuple[bool, bool]:

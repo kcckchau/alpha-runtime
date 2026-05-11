@@ -25,12 +25,13 @@ from packages.messaging.bus import Event, EventBus, EventType
 
 logger = structlog.get_logger(__name__)
 
-# Timeframes we build from 5-second ticks
-TARGET_TIMEFRAMES = [Timeframe.MIN_1, Timeframe.MIN_5]
+# Timeframes we build live from 5-second ticks
+TARGET_TIMEFRAMES = [Timeframe.MIN_1, Timeframe.MIN_5, Timeframe.HOUR_1]
 
 _TIMEFRAME_SECONDS: dict[Timeframe, int] = {
-    Timeframe.MIN_1: 60,
-    Timeframe.MIN_5: 300,
+    Timeframe.MIN_1:  60,
+    Timeframe.MIN_5:  300,
+    Timeframe.HOUR_1: 3600,
 }
 
 
@@ -171,6 +172,32 @@ class CandleEngine:
         for tf in TARGET_TIMEFRAMES:
             self._builders[(symbol, tf)] = _CandleBuilder(symbol, tf)
         logger.info("candle_engine.registered", symbol=symbol)
+
+    def seed_vwap_state(
+        self,
+        symbol: str,
+        cum_volume: float,
+        cum_turnover: float,
+        session: SessionType,
+    ) -> None:
+        """
+        Seed VWAP accumulators from bootstrap so live streaming continues
+        from the correct intra-session cumulative state rather than resetting.
+        """
+        if symbol not in self._symbols:
+            logger.warning("candle_engine.seed_unknown_symbol", symbol=symbol)
+            return
+        for tf in TARGET_TIMEFRAMES:
+            builder = self._builders[(symbol, tf)]
+            builder._cum_volume = cum_volume
+            builder._cum_turnover = cum_turnover
+            builder._current_session = session
+        logger.info(
+            "candle_engine.vwap_seeded",
+            symbol=symbol,
+            cum_volume=cum_volume,
+            session=session,
+        )
 
     async def on_tick(self, tick: Tick) -> None:
         """Entry point: process a normalized tick and emit candle events."""

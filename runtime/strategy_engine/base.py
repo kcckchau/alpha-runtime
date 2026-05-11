@@ -47,11 +47,16 @@ class StrategyEngine:
     Subscribes to CANDLE_FINAL and CONTEXT_UPDATED.
     For each event, runs all registered strategies in order.
     Any returned SetupSignal is published as SIGNAL_DETECTED.
+
+    Historical/bootstrap events (candle.historical=True) are passed to
+    strategies for state warmup but signals are suppressed by default.
+    Set suppress_historical=False to allow signals from replayed sessions.
     """
 
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(self, bus: EventBus, suppress_historical: bool = True) -> None:
         self._bus = bus
         self._strategies: list[Strategy] = []
+        self._suppress_historical = suppress_historical
 
         bus.subscribe(EventType.CANDLE_FINAL, self._on_candle_event)
         bus.subscribe(EventType.CONTEXT_UPDATED, self._on_context_event)
@@ -62,10 +67,11 @@ class StrategyEngine:
 
     async def _on_candle_event(self, event: Event) -> None:
         candle: Candle = event.payload
+        is_historical = candle.historical
         for strategy in self._strategies:
             try:
                 signal = await strategy.on_candle(candle)
-                if signal:
+                if signal and not (is_historical and self._suppress_historical):
                     await self._emit(signal)
             except Exception:
                 logger.exception(
@@ -75,10 +81,11 @@ class StrategyEngine:
 
     async def _on_context_event(self, event: Event) -> None:
         ctx: MarketContext = event.payload
+        is_historical = ctx.historical
         for strategy in self._strategies:
             try:
                 signal = await strategy.on_context_update(ctx)
-                if signal:
+                if signal and not (is_historical and self._suppress_historical):
                     await self._emit(signal)
             except Exception:
                 logger.exception(

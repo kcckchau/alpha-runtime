@@ -49,6 +49,10 @@ class EventType(StrEnum):
     SESSION_CLOSE = "session.close"
     ERROR = "system.error"
 
+    # Bootstrap / backfill lifecycle
+    BOOTSTRAP_STARTED = "bootstrap.started"
+    BOOTSTRAP_COMPLETE = "bootstrap.complete"
+
 
 HandlerFn = Callable[["Event"], Coroutine[Any, Any, None]]
 

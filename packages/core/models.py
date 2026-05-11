@@ -12,6 +12,19 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Optional
 
+# Stable namespace for deterministic candle UUIDs (upsert deduplication)
+_CANDLE_NS = uuid.UUID("a3c4b5d6-e7f8-4a9b-8c0d-1e2f3a4b5c6d")
+
+
+def candle_stable_id(symbol: str, timeframe: str, ts: datetime) -> str:
+    """
+    Return a deterministic UUID for a (symbol, timeframe, timestamp) triple.
+
+    Using this as the candle primary key means loading the same bar twice
+    via bootstrap or recorder will upsert rather than duplicate.
+    """
+    return str(uuid.uuid5(_CANDLE_NS, f"{symbol}:{timeframe}:{ts.isoformat()}"))
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -104,6 +117,7 @@ class Candle(BaseModel):
     cumulative_turnover: float = 0.0  # sum(price * volume) for intra-session VWAP
     session: SessionType = SessionType.RTH
     is_partial: bool = False  # True while the bar is still building
+    historical: bool = False  # True for bootstrap/backfill candles
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +153,10 @@ class IndicatorSnapshot(BaseModel):
     prior_day_low: Optional[float] = None
     premarket_high: Optional[float] = None
     premarket_low: Optional[float] = None
+
+    # Exponential moving averages (RTH-anchored, reset each day)
+    ema_9: Optional[float] = None
+    ema_21: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +199,7 @@ class MarketContext(BaseModel):
 
     session: SessionType = SessionType.RTH
     indicators: Optional[IndicatorSnapshot] = None
+    historical: bool = False  # True for bootstrap/backfill context
 
 
 # ---------------------------------------------------------------------------

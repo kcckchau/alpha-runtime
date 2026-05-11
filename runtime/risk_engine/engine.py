@@ -133,10 +133,8 @@ class RiskEngine:
     async def _on_fill(self, event: Event) -> None:
         from packages.core.models import Fill
         fill: Fill = event.payload
-        # Track realized P&L (simplified — only tracks losses from fills)
-        # A full implementation would match fill to order and compute P&L on exit.
-        key_prefix = fill.symbol
-        self._open_orders.discard(key_prefix)
+        # _open_orders keys are "strategy_id:symbol" — remove all entries for this symbol
+        self._open_orders = {k for k in self._open_orders if not k.endswith(f":{fill.symbol}")}
 
     async def _on_order_closed(self, event: Event) -> None:
         from packages.core.models import OrderResult
