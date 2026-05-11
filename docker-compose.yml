@@ -1,0 +1,76 @@
+version: "3.9"
+
+services:
+  # ---------------------------------------------------------------------------
+  # TimescaleDB (PostgreSQL + time-series extension)
+  # ---------------------------------------------------------------------------
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: alpha-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: alpha
+      POSTGRES_PASSWORD: alpha
+      POSTGRES_DB: alpha_runtime
+    ports:
+      - "5432:5432"
+    volumes:
+      - alpha_db_data:/var/lib/postgresql/data
+      - ./infra/docker/timescaledb/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alpha -d alpha_runtime"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis (Streams backbone for future scale-out)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: alpha-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - alpha_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # alpha-runtime API
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile
+    container_name: alpha-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_DATABASE_URL: postgresql+asyncpg://alpha:alpha@db:5432/alpha_runtime
+      REDIS_URL: redis://redis:6379
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      API_SYMBOLS: '["QQQ"]'
+      IBKR_HOST: host.docker.internal   # TWS running on host machine
+      IBKR_PORT: "7497"
+      RISK_PAPER_MODE: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  alpha_db_data:
+  alpha_redis_data:
