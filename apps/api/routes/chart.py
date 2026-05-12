@@ -265,7 +265,7 @@ def _build_html(
     .bottom {{
       flex: 0 0 auto;
       display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
       height: 148px;
       border-top: 1px solid var(--border);
     }}
@@ -354,6 +354,50 @@ def _build_html(
     }}
     .sig-badge.long  {{ background: rgba(0,230,118,.15); color: var(--green); }}
     .sig-badge.short {{ background: rgba(255,69,96,.15);  color: var(--red); }}
+
+    /* Microstructure panel */
+    .micro-grid {{
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }}
+    .micro-row {{
+      font-family: var(--font-mono);
+      font-size: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }}
+    .micro-key {{ color: var(--muted2); }}
+    .micro-val {{
+      font-weight: 600;
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }}
+    .micro-val.good    {{ color: var(--green); }}
+    .micro-val.warn    {{ color: var(--amber); }}
+    .micro-val.bad     {{ color: var(--red); }}
+    .micro-val.neutral {{ color: var(--text); }}
+    .micro-val.muted   {{ color: var(--muted); }}
+
+    /* Flash animation: liquidity pull alert */
+    @keyframes flashBorder {{
+      0%   {{ border-color: var(--red); box-shadow: 0 0 0 1px var(--red); }}
+      100% {{ border-color: var(--border); box-shadow: none; }}
+    }}
+    .panel.flash-alert {{
+      animation: flashBorder 2s ease-out forwards;
+    }}
+
+    /* Sign-change highlight on pressure value */
+    @keyframes pressureFlash {{
+      0%   {{ background: rgba(255,255,255,.18); }}
+      100% {{ background: transparent; }}
+    }}
+    .micro-val.pressure-flash {{
+      animation: pressureFlash 0.6s ease-out forwards;
+      border-radius: 2px;
+    }}
 
     /* Status bar */
     #statusbar {{
@@ -471,6 +515,27 @@ def _build_html(
       <div class="panel-hdr">Signals</div>
       <div class="signal-feed" id="sigFeed"></div>
     </div>
+    <div class="panel" id="microPanel">
+      <div class="panel-hdr">Microstructure</div>
+      <div class="micro-grid">
+        <div class="micro-row">
+          <span class="micro-key">spread%</span>
+          <span class="micro-val neutral" id="mSpread">—</span>
+        </div>
+        <div class="micro-row">
+          <span class="micro-key">pressure</span>
+          <span class="micro-val neutral" id="mPressure">—</span>
+        </div>
+        <div class="micro-row">
+          <span class="micro-key">pull</span>
+          <span class="micro-val muted" id="mPull">—</span>
+        </div>
+        <div class="micro-row">
+          <span class="micro-key">imbalance</span>
+          <span class="micro-val neutral" id="mImbalance">—</span>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- Status bar -->
@@ -497,6 +562,8 @@ let liveEma21   = null;
 let openRef     = null;   // first bar's open for day change %
 let candleWs    = null;
 let signalWs    = null;
+let microWs     = null;
+let _prevMicro  = {{ spread_pct: null, quote_pressure: null, liquidity_pull: null, bid_ask_imbalance: null }};
 let ctxTimer    = null;
 let activeLines = [];     // signal price lines on chart
 let baseRows    = [];     // cached 1m rows — used to resample 5m/1h client-side
@@ -1024,6 +1091,71 @@ function reconnectCandleWs() {{
   connectCandleWs();
 }}
 
+// ── WebSocket: microstructure ─────────────────────────────────────────
+function updateMicro(data) {{
+  const EPS = 0.001;
+
+  // spread%
+  const sp = data.spread_pct;
+  if (_prevMicro.spread_pct === null || Math.abs((sp ?? 0) - (_prevMicro.spread_pct ?? 0)) > EPS) {{
+    const el = $("mSpread");
+    el.textContent = typeof sp === "number" ? sp.toFixed(3) + "%" : "—";
+    el.className = "micro-val " + (sp === null || sp === undefined ? "neutral" : sp < 0.03 ? "good" : sp <= 0.05 ? "warn" : "bad");
+    _prevMicro.spread_pct = sp;
+  }}
+
+  // quote pressure
+  const qp = data.quote_pressure;
+  if (_prevMicro.quote_pressure === null || Math.abs((qp ?? 0) - (_prevMicro.quote_pressure ?? 0)) > EPS) {{
+    const el = $("mPressure");
+    const prevSign = _prevMicro.quote_pressure !== null ? Math.sign(_prevMicro.quote_pressure) : 0;
+    el.textContent = typeof qp === "number" ? (qp >= 0 ? "+" : "") + qp.toFixed(3) : "—";
+    el.className = "micro-val " + (qp === null || qp === undefined ? "neutral" : qp > 0.1 ? "good" : qp < -0.1 ? "bad" : "neutral");
+    if (_prevMicro.quote_pressure !== null && typeof qp === "number" && Math.sign(qp) !== prevSign) {{
+      el.classList.add("pressure-flash");
+      setTimeout(() => el.classList.remove("pressure-flash"), 600);
+    }}
+    _prevMicro.quote_pressure = qp;
+  }}
+
+  // liquidity pull
+  const pull = data.liquidity_pull;
+  if (pull !== _prevMicro.liquidity_pull) {{
+    const el = $("mPull");
+    el.textContent = pull ? "YES" : "no";
+    el.className = "micro-val " + (pull ? "bad" : "muted");
+    if (pull) {{
+      const panel = $("microPanel");
+      panel.classList.remove("flash-alert");
+      void panel.offsetWidth;  // force reflow to restart animation
+      panel.classList.add("flash-alert");
+      setTimeout(() => panel.classList.remove("flash-alert"), 2000);
+    }}
+    _prevMicro.liquidity_pull = pull;
+  }}
+
+  // bid/ask imbalance
+  const imb = data.bid_ask_imbalance;
+  if (_prevMicro.bid_ask_imbalance === null || Math.abs((imb ?? 0) - (_prevMicro.bid_ask_imbalance ?? 0)) > EPS) {{
+    const el = $("mImbalance");
+    el.textContent = typeof imb === "number" ? (imb >= 0 ? "+" : "") + imb.toFixed(3) : "—";
+    el.className = "micro-val " + (imb === null || imb === undefined ? "neutral" : imb > 0 ? "good" : imb < 0 ? "bad" : "neutral");
+    _prevMicro.bid_ask_imbalance = imb;
+  }}
+}}
+
+function connectMicroWs() {{
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${{proto}}://${{location.host}}/ws/microstructure`);
+  microWs = ws;
+  ws.onmessage = evt => {{
+    const msg = JSON.parse(evt.data);
+    if (msg.type === "microstructure" && msg.symbol === SYMBOL) updateMicro(msg);
+  }};
+  ws.onclose = () => {{ if (microWs === ws) setTimeout(connectMicroWs, 1500); }};
+  ws.onerror = () => ws.close();
+}}
+
 // ── WebSocket: signals ────────────────────────────────────────────────
 function connectSignalWs() {{
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -1043,6 +1175,7 @@ function connectSignalWs() {{
   if (LIVE_CANDLE_WS) connectCandleWs();
   else setWsState("historical");
   connectSignalWs();
+  connectMicroWs();
   pollContext();
 }})();
 </script>

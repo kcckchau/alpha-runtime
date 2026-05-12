@@ -48,8 +48,9 @@ class EventRecorder:
         bus.subscribe(EventType.CONTEXT_UPDATED, self._on_context)
         bus.subscribe(EventType.SIGNAL_DETECTED, self._on_signal)
         bus.subscribe(EventType.ORDER_SUBMITTED, self._on_order)
-        bus.subscribe(EventType.ORDER_FILLED, self._on_fill_or_result)
-        bus.subscribe(EventType.ORDER_CANCELLED, self._on_fill_or_result)
+        bus.subscribe(EventType.ORDER_FILLED, self._on_fill)
+        bus.subscribe(EventType.ORDER_RESULT_UPDATED, self._on_order_result)
+        bus.subscribe(EventType.ORDER_CANCELLED, self._on_order_result)
 
     async def _on_candle(self, event: Event) -> None:
         candle: Candle = event.payload
@@ -157,22 +158,23 @@ class EventRecorder:
         )
         await self._upsert(orm, "order", result.id)
 
-    async def _on_fill_or_result(self, event: Event) -> None:
-        payload = event.payload
-        if isinstance(payload, Fill):
-            orm = FillORM(
-                id=payload.id,
-                order_id=payload.order_id,
-                symbol=payload.symbol,
-                side=payload.side,
-                quantity=payload.quantity,
-                price=payload.price,
-                timestamp=payload.timestamp,
-                paper=payload.paper,
-            )
-            await self._upsert(orm, "fill", payload.id)
-        elif isinstance(payload, OrderResult):
-            await self._on_order(event)
+    async def _on_fill(self, event: Event) -> None:
+        fill: Fill = event.payload
+        orm = FillORM(
+            id=fill.id,
+            order_id=fill.order_id,
+            symbol=fill.symbol,
+            side=fill.side,
+            quantity=fill.quantity,
+            price=fill.price,
+            timestamp=fill.timestamp,
+            paper=fill.paper,
+        )
+        await self._upsert(orm, "fill", fill.id)
+
+    async def _on_order_result(self, event: Event) -> None:
+        result: OrderResult = event.payload
+        await self._on_order(event)
 
     async def _upsert(self, orm_obj: object, entity: str, entity_id: str) -> None:
         try:

@@ -4,14 +4,16 @@ alpha-runtime API entry point.
 Wires the full pipeline on startup:
   market_data → candle_engine → indicator_engine → context_engine
               → quote_engine → orderbook_engine → microstructure_engine
-  → strategy_engine → risk_engine → execution_engine
+  → strategy_engine → risk_engine → execution_engine → position_engine
 
 Serves REST endpoints and WebSocket feeds.
 """
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator
 
 import structlog
@@ -23,10 +25,12 @@ from apps.api.config import get_api_settings
 from apps.api.logging import configure_logging
 from apps.api.routes import candles, chart, context, health, signals
 from apps.api.routes import bootstrap as bootstrap_route
+from apps.api.routes import positions as positions_route
 from apps.api.websockets.feeds import router as ws_router
 from apps.api.state import AppState
-from packages.core.models import OrderBookSnapshot, QuoteSnapshot, Tick as TickModel
-from packages.db.session import init_db
+from packages.core.models import OrderBookSnapshot, QuoteSnapshot, SignalStatus, Tick as TickModel
+from packages.db.orm_models import SignalORM
+from packages.db.session import get_session, init_db
 from packages.messaging.bus import Event, EventType, get_bus
 from runtime.bootstrap import BootstrapService
 from runtime.bootstrap.config import BootstrapSettings
@@ -37,15 +41,51 @@ from runtime.indicator_engine import IndicatorEngine
 from runtime.market_data.ibkr import IBKRAdapter
 from runtime.microstructure_engine import MicrostructureEngine
 from runtime.orderbook_engine import OrderBookEngine
+from runtime.position_engine import PositionEngine
 from runtime.quote_engine import QuoteEngine
 from runtime.replay_engine import EventRecorder
 from runtime.risk_engine import RiskEngine
+from runtime.risk_engine.config import get_risk_settings
 from runtime.strategy_engine import StrategyEngine
 from runtime.strategy_engine.strategies import VWAPReclaimLong
 
 configure_logging()
 logger = structlog.get_logger(__name__)
 settings = get_api_settings()
+
+
+async def _signal_expiry_loop(bus, risk_settings) -> None:
+    """Background task: expire PENDING_APPROVAL signals older than signal_expiry_minutes."""
+    from sqlalchemy import select as sa_select, update as sa_update
+    while True:
+        await asyncio.sleep(60)
+        try:
+            threshold = datetime.now(tz=timezone.utc) - timedelta(
+                minutes=risk_settings.signal_expiry_minutes
+            )
+            async with get_session() as db:
+                stmt = sa_select(SignalORM).where(
+                    SignalORM.status == SignalStatus.PENDING_APPROVAL,
+                    SignalORM.timestamp < threshold,
+                )
+                result = await db.execute(stmt)
+                rows = result.scalars().all()
+                for row in rows:
+                    row.status = SignalStatus.EXPIRED
+                    await bus.publish(
+                        Event(
+                            type=EventType.SIGNAL_EXPIRED,
+                            payload=row.id,
+                            source="api",
+                        )
+                    )
+                    logger.info("signal_expiry.expired", signal_id=row.id)
+                if rows:
+                    logger.info("signal_expiry.batch", count=len(rows))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("signal_expiry.error")
 
 
 @asynccontextmanager
@@ -69,6 +109,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     risk_engine = RiskEngine(bus)
     execution_engine = ExecutionEngine(bus, paper=True)
+    position_engine = PositionEngine(bus)
     _recorder = EventRecorder(bus)  # noqa: F841 — subscribes itself
 
     # ── Microstructure pipeline ──────────────────────────────────────
@@ -88,6 +129,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.strategy_engine = strategy_engine
     state.risk_engine = risk_engine
     state.execution_engine = execution_engine
+    state.position_engine = position_engine
     state.bus = bus
     state.bootstrap_status = bootstrap_svc.status
 
@@ -98,6 +140,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         quote_engine.register_symbol(symbol)
         orderbook_engine.register_symbol(symbol)
         microstructure_engine.register_symbol(symbol)
+        position_engine.register_symbol(symbol)
         strategy_engine.register(VWAPReclaimLong(symbol=symbol))
         bootstrap_svc.register_symbol(symbol)
 
@@ -140,9 +183,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info("api.ready")
 
+    # ---- background: expire stale pending-approval signals ----
+    _expiry_task = asyncio.create_task(_signal_expiry_loop(bus, get_risk_settings()))
+
     yield  # ---- running ----
 
     # ---- shutdown ----
+    _expiry_task.cancel()
     if state.adapter:
         await state.adapter.disconnect()
     logger.info("api.shutdown")
@@ -165,6 +212,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(candles.router)
 app.include_router(signals.router)
+app.include_router(positions_route.router)
 app.include_router(context.router)
 app.include_router(chart.router)
 app.include_router(bootstrap_route.router)

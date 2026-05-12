@@ -1,22 +1,24 @@
 """
 WebSocket live feeds.
 
-/ws/candles  — streams CANDLE_FINAL events (all symbols)
-/ws/signals  — streams SIGNAL_DETECTED events
-/ws/fills    — streams ORDER_FILLED events
+/ws/candles        — streams CANDLE_FINAL / CANDLE_PARTIAL events
+/ws/signals        — streams SIGNAL_DETECTED events
+/ws/fills          — streams ORDER_FILLED events (Fill payload only)
+/ws/microstructure — streams MICROSTRUCTURE_UPDATED events
+/ws/positions      — streams POSITION_OPENED / POSITION_UPDATED events
 
-Each feed maintains a set of connected clients. The event bus handler
+Each feed maintains a set of connected clients.  The event bus handler
 broadcasts to all connected clients; disconnected clients are pruned.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
 from packages.messaging.bus import Event, EventType, get_bus
 
 router = APIRouter(prefix="/ws", tags=["websocket"])
@@ -50,6 +52,8 @@ class _Broadcaster:
 _candle_bcast = _Broadcaster()
 _signal_bcast = _Broadcaster()
 _fill_bcast = _Broadcaster()
+_micro_bcast = _Broadcaster()
+_position_bcast = _Broadcaster()
 
 
 async def _setup_bus_handlers() -> None:
@@ -113,13 +117,51 @@ async def _setup_bus_handlers() -> None:
             }
         )
 
+    async def on_microstructure(event: Event) -> None:
+        m = event.payload
+        await _micro_bcast.broadcast(
+            {
+                "type": "microstructure",
+                "symbol": m.symbol,
+                "spread_pct": m.spread_pct,
+                "quote_pressure": m.quote_pressure,
+                "liquidity_pull": m.liquidity_pull,
+                "bid_ask_imbalance": m.bid_ask_imbalance,
+            }
+        )
+
+    async def on_position(event: Event) -> None:
+        pos = event.payload
+        await _position_bcast.broadcast(
+            {
+                "type": "position_update",
+                "data": {
+                    "position_id": pos.position_id,
+                    "symbol": pos.symbol,
+                    "strategy_id": pos.strategy_id,
+                    "signal_id": pos.signal_id,
+                    "entry_price": pos.entry_price,
+                    "stop_price": pos.stop_price,
+                    "target_price": pos.target_price,
+                    "quantity": pos.quantity,
+                    "side": pos.side,
+                    "opened_at": pos.opened_at.isoformat(),
+                    "status": pos.status,
+                    "current_price": pos.current_price,
+                    "unrealized_pnl": pos.unrealized_pnl,
+                },
+            }
+        )
+
     bus.subscribe(EventType.CANDLE_FINAL, on_candle)
     bus.subscribe(EventType.CANDLE_PARTIAL, on_candle)
     bus.subscribe(EventType.SIGNAL_DETECTED, on_signal)
     bus.subscribe(EventType.ORDER_FILLED, on_fill)
+    bus.subscribe(EventType.MICROSTRUCTURE_UPDATED, on_microstructure)
+    bus.subscribe(EventType.POSITION_OPENED, on_position)
+    bus.subscribe(EventType.POSITION_UPDATED, on_position)
 
 
-# Register handlers once on first import via a startup hook
 _handlers_registered = False
 
 
@@ -138,7 +180,7 @@ async def ws_candles(ws: WebSocket) -> None:
     logger.info("ws.candle_connected")
     try:
         while True:
-            await ws.receive_text()  # keep-alive; client may send pings
+            await ws.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
@@ -176,3 +218,35 @@ async def ws_fills(ws: WebSocket) -> None:
     finally:
         _fill_bcast.remove(ws)
         logger.info("ws.fill_disconnected")
+
+
+@router.websocket("/microstructure")
+async def ws_microstructure(ws: WebSocket) -> None:
+    await _ensure_handlers()
+    await ws.accept()
+    _micro_bcast.add(ws)
+    logger.info("ws.microstructure_connected")
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _micro_bcast.remove(ws)
+        logger.info("ws.microstructure_disconnected")
+
+
+@router.websocket("/positions")
+async def ws_positions(ws: WebSocket) -> None:
+    await _ensure_handlers()
+    await ws.accept()
+    _position_bcast.add(ws)
+    logger.info("ws.positions_connected")
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _position_bcast.remove(ws)
+        logger.info("ws.positions_disconnected")

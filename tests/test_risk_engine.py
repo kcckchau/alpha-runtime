@@ -53,7 +53,7 @@ def _make_fill(symbol: str = "QQQ") -> Fill:
 
 
 def _low_rr_settings() -> RiskSettings:
-    return RiskSettings(rth_only=False, min_rr=0.0, max_daily_loss=10_000.0, risk_per_trade=100.0, max_shares=500.0)
+    return RiskSettings(rth_only=False, min_rr=0.0, max_daily_loss=10_000.0, risk_per_trade=100.0, max_shares=500.0, auto_approve=True)
 
 
 @pytest.mark.asyncio

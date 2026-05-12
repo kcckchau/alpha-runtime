@@ -46,8 +46,17 @@ class EventType(StrEnum):
     ORDER_REQUESTED = "order.requested"
     ORDER_SUBMITTED = "order.submitted"
     ORDER_FILLED = "order.filled"
+    ORDER_RESULT_UPDATED = "order.result_updated"
     ORDER_CANCELLED = "order.cancelled"
     ORDER_REJECTED = "order.rejected"
+
+    # Position management
+    POSITION_OPENED = "position.opened"
+    POSITION_UPDATED = "position.updated"
+    EXIT_TRIGGERED = "position.exit_triggered"
+
+    # Signal approval gate
+    SIGNAL_PENDING = "signal.pending"
 
     # System
     SESSION_OPEN = "session.open"

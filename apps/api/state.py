@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from runtime.execution_engine import ExecutionEngine
     from runtime.indicator_engine import IndicatorEngine
     from runtime.market_data.adapter import MarketDataAdapter
+    from runtime.position_engine import PositionEngine
     from runtime.risk_engine import RiskEngine
     from runtime.strategy_engine import StrategyEngine
 
@@ -32,6 +33,7 @@ class AppState:
         self.strategy_engine: Optional["StrategyEngine"] = None
         self.risk_engine: Optional["RiskEngine"] = None
         self.execution_engine: Optional["ExecutionEngine"] = None
+        self.position_engine: Optional["PositionEngine"] = None
         self.bootstrap_status: Optional["BootstrapStatus"] = None
 
     @classmethod

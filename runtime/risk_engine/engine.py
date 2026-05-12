@@ -64,6 +64,7 @@ class RiskEngine:
         bus.subscribe(EventType.SIGNAL_DETECTED, self._on_signal)
         bus.subscribe(EventType.ORDER_FILLED, self._on_fill)
         bus.subscribe(EventType.ORDER_CANCELLED, self._on_order_closed)
+        bus.subscribe(EventType.ORDER_RESULT_UPDATED, self._on_order_closed)
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -91,7 +92,28 @@ class RiskEngine:
             )
             return
 
-        # Approve
+        if not self._cfg.auto_approve:
+            signal.status = SignalStatus.PENDING_APPROVAL
+            await self._bus.publish(
+                Event(
+                    type=EventType.SIGNAL_PENDING,
+                    payload=signal,
+                    source="risk_engine",
+                )
+            )
+            logger.info(
+                "risk_engine.signal_pending_approval",
+                symbol=signal.symbol,
+                strategy_id=signal.strategy_id,
+                signal_id=signal.id,
+            )
+            return
+
+        # Auto-approve path
+        await self._approve_signal(signal)
+
+    async def _approve_signal(self, signal: SetupSignal) -> None:
+        """Shared approval logic used by auto-approve and the manual API endpoint."""
         signal.status = SignalStatus.APPROVED
         quantity = self._size_position(signal)
         key = f"{signal.strategy_id}:{signal.symbol}"
@@ -168,13 +190,7 @@ class RiskEngine:
         return None
 
     def _size_position(self, signal: SetupSignal) -> float:
-        """Fixed dollar-risk position sizing."""
-        risk_per_share = abs(signal.entry_price - signal.stop_price)
-        if risk_per_share <= 0:
-            return 1.0
-        shares = self._cfg.risk_per_trade / risk_per_share
-        shares = min(shares, self._cfg.max_shares)
-        return max(1.0, round(shares))
+        return self.size_position(signal.entry_price, signal.stop_price)
 
     def _maybe_reset_daily_counters(self) -> None:
         today = datetime.now(tz=timezone.utc).astimezone(_ET).date()
@@ -183,6 +199,19 @@ class RiskEngine:
             self._open_orders.clear()
             self._last_reset_date = today
             logger.info("risk_engine.daily_reset", date=str(today))
+
+    def size_position(self, entry_price: float, stop_price: float) -> float:
+        """Public fixed dollar-risk position sizing (used by API approval endpoint)."""
+        risk_per_share = abs(entry_price - stop_price)
+        if risk_per_share <= 0:
+            return 1.0
+        shares = self._cfg.risk_per_trade / risk_per_share
+        shares = min(shares, self._cfg.max_shares)
+        return max(1.0, round(shares))
+
+    def mark_order_open(self, strategy_id: str, symbol: str) -> None:
+        """Register an open order slot — called by the manual approval API endpoint."""
+        self._open_orders.add(f"{strategy_id}:{symbol}")
 
     def record_realized_loss(self, amount: float) -> None:
         """Called by execution engine to track realized P&L."""

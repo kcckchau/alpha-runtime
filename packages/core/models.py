@@ -57,6 +57,7 @@ class SignalDirection(StrEnum):
 
 class SignalStatus(StrEnum):
     PENDING = "pending"
+    PENDING_APPROVAL = "pending_approval"
     APPROVED = "approved"
     REJECTED = "rejected"
     EXPIRED = "expired"
@@ -390,3 +391,57 @@ class OrderResult(BaseModel):
     updated_at: Optional[datetime] = None
     paper: bool = True
     error_message: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Position management
+# ---------------------------------------------------------------------------
+
+
+class PositionStatus(StrEnum):
+    OPEN = "open"
+    STOPPED = "stopped"
+    TARGETED = "targeted"
+    CLOSED = "closed"
+
+
+class ExitReason(StrEnum):
+    STOP_HIT = "stop_hit"
+    TARGET_HIT = "target_hit"
+    MANUAL = "manual"
+
+
+class Position(BaseModel):
+    """In-memory tracking of an open position derived from a filled order."""
+
+    model_config = ConfigDict(frozen=False)
+
+    position_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    symbol: str
+    strategy_id: str
+    signal_id: str
+    entry_price: float
+    stop_price: float
+    target_price: float
+    quantity: float
+    side: OrderSide
+    opened_at: datetime
+    status: PositionStatus = PositionStatus.OPEN
+    current_price: Optional[float] = None
+    unrealized_pnl: Optional[float] = None
+
+
+class ExitTrigger(BaseModel):
+    """Payload published when a position's stop or target is hit."""
+
+    model_config = ConfigDict(frozen=True)
+
+    position_id: str
+    symbol: str
+    strategy_id: str
+    signal_id: str
+    side: OrderSide
+    reason: ExitReason
+    fill_price: float
+    quantity: float
+    timestamp: datetime

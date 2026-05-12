@@ -182,7 +182,7 @@ class ExecutionEngine:
             )
             await self._bus.publish(
                 Event(
-                    type=EventType.ORDER_FILLED,
+                    type=EventType.ORDER_RESULT_UPDATED,
                     payload=result,
                     source="execution_engine",
                 )
