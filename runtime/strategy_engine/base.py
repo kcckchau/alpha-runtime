@@ -8,6 +8,10 @@ They MUST NOT:
 - Depend on execution or risk engines.
 
 They receive domain events and return optional SetupSignal objects.
+
+Microstructure is delivered as an optional parameter to on_context_update().
+Strategies that want to use it should declare the parameter; those that
+don't can ignore it — the signature is backward-compatible via a default.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from typing import Optional
 
 import structlog
 
-from packages.core.models import Candle, MarketContext, SetupSignal
+from packages.core.models import Candle, MarketContext, MicrostructureSnapshot, SetupSignal
 from packages.messaging.bus import Event, EventBus, EventType
 
 logger = structlog.get_logger(__name__)
@@ -36,17 +40,43 @@ class Strategy(ABC):
         """Called on every final candle. Return a signal or None."""
 
     @abstractmethod
-    async def on_context_update(self, context: MarketContext) -> Optional[SetupSignal]:
-        """Called on every context update. Return a signal or None."""
+    async def on_context_update(
+        self,
+        context: MarketContext,
+        microstructure: Optional[MicrostructureSnapshot] = None,
+    ) -> Optional[SetupSignal]:
+        """
+        Called on every context update.
+
+        *microstructure* is the latest MicrostructureSnapshot for the same
+        symbol if the MicrostructureEngine is running, otherwise None.
+        Strategies must treat None as "data unavailable" and should NOT
+        reject signals solely because microstructure is missing.
+        """
+
+    async def on_microstructure_update(
+        self, snap: MicrostructureSnapshot
+    ) -> Optional[SetupSignal]:
+        """
+        Optional hook called on every MICROSTRUCTURE_UPDATED event.
+
+        Default implementation returns None so strategies that only use
+        microstructure as a confirmation filter (via on_context_update) do
+        not need to override this.
+        """
+        return None
 
 
 class StrategyEngine:
     """
     Orchestrates registered strategy plugins.
 
-    Subscribes to CANDLE_FINAL and CONTEXT_UPDATED.
-    For each event, runs all registered strategies in order.
-    Any returned SetupSignal is published as SIGNAL_DETECTED.
+    Subscribes to:
+      CANDLE_FINAL           → calls strategy.on_candle()
+      CONTEXT_UPDATED        → calls strategy.on_context_update() with latest
+                               MicrostructureSnapshot injected automatically
+      MICROSTRUCTURE_UPDATED → stores latest snapshot per symbol AND calls
+                               strategy.on_microstructure_update()
 
     Historical/bootstrap events (candle.historical=True) are passed to
     strategies for state warmup but signals are suppressed by default.
@@ -57,13 +87,20 @@ class StrategyEngine:
         self._bus = bus
         self._strategies: list[Strategy] = []
         self._suppress_historical = suppress_historical
+        # Latest microstructure per symbol — injected into on_context_update
+        self._latest_micro: dict[str, MicrostructureSnapshot] = {}
 
         bus.subscribe(EventType.CANDLE_FINAL, self._on_candle_event)
         bus.subscribe(EventType.CONTEXT_UPDATED, self._on_context_event)
+        bus.subscribe(EventType.MICROSTRUCTURE_UPDATED, self._on_microstructure_event)
 
     def register(self, strategy: Strategy) -> None:
         self._strategies.append(strategy)
         logger.info("strategy_engine.registered", strategy_id=strategy.strategy_id)
+
+    # ------------------------------------------------------------------
+    # Bus handlers
+    # ------------------------------------------------------------------
 
     async def _on_candle_event(self, event: Event) -> None:
         candle: Candle = event.payload
@@ -82,14 +119,29 @@ class StrategyEngine:
     async def _on_context_event(self, event: Event) -> None:
         ctx: MarketContext = event.payload
         is_historical = ctx.historical
+        micro = self._latest_micro.get(ctx.symbol)
         for strategy in self._strategies:
             try:
-                signal = await strategy.on_context_update(ctx)
+                signal = await strategy.on_context_update(ctx, micro)
                 if signal and not (is_historical and self._suppress_historical):
                     await self._emit(signal)
             except Exception:
                 logger.exception(
                     "strategy_engine.context_error",
+                    strategy_id=strategy.strategy_id,
+                )
+
+    async def _on_microstructure_event(self, event: Event) -> None:
+        snap: MicrostructureSnapshot = event.payload
+        self._latest_micro[snap.symbol] = snap
+        for strategy in self._strategies:
+            try:
+                signal = await strategy.on_microstructure_update(snap)
+                if signal:
+                    await self._emit(signal)
+            except Exception:
+                logger.exception(
+                    "strategy_engine.microstructure_error",
                     strategy_id=strategy.strategy_id,
                 )
 

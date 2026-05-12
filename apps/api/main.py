@@ -3,6 +3,7 @@ alpha-runtime API entry point.
 
 Wires the full pipeline on startup:
   market_data → candle_engine → indicator_engine → context_engine
+              → quote_engine → orderbook_engine → microstructure_engine
   → strategy_engine → risk_engine → execution_engine
 
 Serves REST endpoints and WebSocket feeds.
@@ -24,7 +25,7 @@ from apps.api.routes import candles, chart, context, health, signals
 from apps.api.routes import bootstrap as bootstrap_route
 from apps.api.websockets.feeds import router as ws_router
 from apps.api.state import AppState
-from packages.core.models import Tick as TickModel
+from packages.core.models import OrderBookSnapshot, QuoteSnapshot, Tick as TickModel
 from packages.db.session import init_db
 from packages.messaging.bus import Event, EventType, get_bus
 from runtime.bootstrap import BootstrapService
@@ -34,6 +35,9 @@ from runtime.context_engine import ContextEngine
 from runtime.execution_engine import ExecutionEngine
 from runtime.indicator_engine import IndicatorEngine
 from runtime.market_data.ibkr import IBKRAdapter
+from runtime.microstructure_engine import MicrostructureEngine
+from runtime.orderbook_engine import OrderBookEngine
+from runtime.quote_engine import QuoteEngine
 from runtime.replay_engine import EventRecorder
 from runtime.risk_engine import RiskEngine
 from runtime.strategy_engine import StrategyEngine
@@ -67,6 +71,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     execution_engine = ExecutionEngine(bus, paper=True)
     _recorder = EventRecorder(bus)  # noqa: F841 — subscribes itself
 
+    # ── Microstructure pipeline ──────────────────────────────────────
+    # QuoteEngine and OrderBookEngine are thin bridge layers that put
+    # adapter callbacks onto the bus.  MicrostructureEngine subscribes
+    # to those bus events and computes derived metrics.
+    # All three degrade gracefully when L1/L2 data is unavailable.
+    quote_engine = QuoteEngine(bus)
+    orderbook_engine = OrderBookEngine(bus)
+    microstructure_engine = MicrostructureEngine(bus)
+
     bootstrap_svc = BootstrapService(bus, candle_engine, bootstrap_settings)
 
     state.candle_engine = candle_engine
@@ -82,6 +95,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         candle_engine.register_symbol(symbol)
         indicator_engine.register_symbol(symbol)
         context_engine.register_symbol(symbol)
+        quote_engine.register_symbol(symbol)
+        orderbook_engine.register_symbol(symbol)
+        microstructure_engine.register_symbol(symbol)
         strategy_engine.register(VWAPReclaimLong(symbol=symbol))
         bootstrap_svc.register_symbol(symbol)
 
@@ -93,7 +109,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         await candle_engine.on_tick(tick)
 
+    async def on_quote(quote: QuoteSnapshot) -> None:
+        await quote_engine.on_quote(quote)
+
+    async def on_depth(snap: OrderBookSnapshot) -> None:
+        await orderbook_engine.on_depth_update(snap)
+
     adapter.on_tick(on_tick)
+    adapter.on_quote(on_quote)
+    adapter.on_depth_update(on_depth)
     state.adapter = adapter
 
     # connect() is non-blocking: tries once, schedules background retries on failure

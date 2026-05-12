@@ -27,6 +27,11 @@ class EventType(StrEnum):
     CANDLE_PARTIAL = "candle.partial"
     CANDLE_FINAL = "candle.final"
 
+    # Microstructure pipeline (L1 quotes, L2 depth, computed metrics)
+    QUOTE_UPDATED = "quote.updated"
+    ORDERBOOK_UPDATED = "orderbook.updated"
+    MICROSTRUCTURE_UPDATED = "microstructure.updated"
+
     # Indicator / context
     INDICATORS_UPDATED = "indicators.updated"
     CONTEXT_UPDATED = "context.updated"
@@ -52,6 +57,27 @@ class EventType(StrEnum):
     # Bootstrap / backfill lifecycle
     BOOTSTRAP_STARTED = "bootstrap.started"
     BOOTSTRAP_COMPLETE = "bootstrap.complete"
+
+
+# ---------------------------------------------------------------------------
+# Typed channel helpers
+# ---------------------------------------------------------------------------
+# Events are typed by EventType; these helpers produce the namespaced
+# "channel" strings used in log context and future Redis pub/sub migration.
+
+def quote_channel(symbol: str) -> str:
+    """alpha:quotes:{symbol}"""
+    return f"alpha:quotes:{symbol}"
+
+
+def orderbook_channel(symbol: str) -> str:
+    """alpha:orderbook:{symbol}"""
+    return f"alpha:orderbook:{symbol}"
+
+
+def microstructure_channel(symbol: str) -> str:
+    """alpha:microstructure:{symbol}"""
+    return f"alpha:microstructure:{symbol}"
 
 
 HandlerFn = Callable[["Event"], Coroutine[Any, Any, None]]

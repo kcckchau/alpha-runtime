@@ -4,9 +4,11 @@ IBKR market data adapter using ib_insync.
 Key design constraints:
 - ib_insync uses its own IB event loop (util.startLoop / asyncio integration).
 - We bridge it into the main asyncio loop via run_coro_threadsafe where needed.
-- We use reqRealTimeBars (5-second bars) as the primary data source.
+- Real-time bars (5-second) are the primary tick source → CandleEngine.
+- reqMktData provides L1 bid/ask updates → QuoteEngine / MicrostructureEngine.
+- reqMktDepth provides optional L2 depth → OrderBookEngine / MicrostructureEngine.
 - Reconnect logic uses exponential back-off capped at 60 s.
-- The adapter NEVER leaks ib_insync types to callers — all output is Tick.
+- The adapter NEVER leaks ib_insync types to callers — all output is typed models.
 """
 
 from __future__ import annotations
@@ -16,11 +18,22 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
-from ib_insync import IB, Contract, RealTimeBar, Stock
+from ib_insync import IB, Contract, RealTimeBar, Stock, Ticker
 from ib_insync.decoder import Decoder
 
-from packages.core.models import SessionType, Tick
-from runtime.market_data.adapter import MarketDataAdapter, TickCallback
+from packages.core.models import (
+    BookLevel,
+    OrderBookSnapshot,
+    QuoteSnapshot,
+    SessionType,
+    Tick,
+)
+from runtime.market_data.adapter import (
+    DepthCallback,
+    MarketDataAdapter,
+    QuoteCallback,
+    TickCallback,
+)
 from runtime.market_data.ibkr.config import IBKRSettings, get_ibkr_settings
 from runtime.market_data.ibkr.session_classifier import classify_session
 
@@ -60,27 +73,41 @@ def _normalize_bar_time(value: object) -> datetime:
     """Normalize ib_insync RealTimeBar.time to a UTC-aware datetime."""
     if isinstance(value, datetime):
         return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    # Some IB API paths return epoch seconds instead.
     return datetime.fromtimestamp(float(value), tz=timezone.utc)
+
+
+def _safe_float(value: object) -> Optional[float]:
+    """Return float if value is a valid finite number, else None."""
+    try:
+        f = float(value)  # type: ignore[arg-type]
+        return f if f == f and f != float("inf") and f != float("-inf") else None
+    except (TypeError, ValueError):
+        return None
 
 
 class IBKRAdapter(MarketDataAdapter):
     """
-    Connects to TWS / IB Gateway, subscribes to 5-second real-time bars,
-    and publishes normalized :class:`Tick` events to registered callbacks.
+    Connects to TWS / IB Gateway and streams:
+      - 5-second real-time bars  → TickCallback (CandleEngine)
+      - L1 bid/ask quotes        → QuoteCallback (QuoteEngine / MicrostructureEngine)
+      - L2 market depth          → DepthCallback (OrderBookEngine / MicrostructureEngine)
+        (only when settings.stream_depth=True)
     """
 
     def __init__(self, settings: Optional[IBKRSettings] = None) -> None:
         self._settings = settings or get_ibkr_settings()
         _install_decoder_guard()
         self._ib: IB = IB()
-        self._callbacks: list[TickCallback] = []
+        self._tick_callbacks: list[TickCallback] = []
+        self._quote_callbacks: list[QuoteCallback] = []
+        self._depth_callbacks: list[DepthCallback] = []
         self._subscriptions: dict[str, Contract] = {}
+        # Per-symbol depth book accumulator (mutable, keyed by (op, side, row))
+        self._depth_books: dict[str, dict[tuple[int, int], BookLevel]] = {}
         self._connected = False
         self._reconnect_task: Optional[asyncio.Task[None]] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Wire IB disconnect event → reconnect handler
         self._ib.disconnectedEvent += self._on_disconnected
 
     # ------------------------------------------------------------------
@@ -88,10 +115,6 @@ class IBKRAdapter(MarketDataAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self) -> None:
-        """
-        Attempt one connection and, if it fails, schedule background retries.
-        This returns quickly so the API startup is never blocked by IBKR.
-        """
         self._loop = asyncio.get_running_loop()
         connected = await self._try_once()
         if not connected:
@@ -100,7 +123,6 @@ class IBKRAdapter(MarketDataAdapter):
                 host=self._settings.host,
                 port=self._settings.port,
             )
-            # Schedule background retry loop — does not block startup
             self._start_retry_loop()
 
     async def disconnect(self) -> None:
@@ -118,7 +140,9 @@ class IBKRAdapter(MarketDataAdapter):
 
         contract = Stock(symbol, "SMART", "USD")
         await self._ib.qualifyContractsAsync(contract)
+        self._subscriptions[symbol] = contract
 
+        # ── 5-second real-time bars (Tick/CandleEngine) ──────────────
         bars = self._ib.reqRealTimeBars(
             contract,
             barSize=5,
@@ -126,31 +150,60 @@ class IBKRAdapter(MarketDataAdapter):
             useRTH=False,
         )
         bars.updateEvent += self._make_bar_handler(symbol)
-        self._subscriptions[symbol] = contract
+
+        # ── L1 quote stream ──────────────────────────────────────────
+        if self._settings.stream_quotes:
+            ticker: Ticker = self._ib.reqMktData(
+                contract,
+                genericTickList="",
+                snapshot=False,
+                regulatorySnapshot=False,
+            )
+            ticker.updateEvent += self._make_quote_handler(symbol)
+            logger.info("ibkr.quotes_subscribed", symbol=symbol)
+
+        # ── L2 depth stream ──────────────────────────────────────────
+        if self._settings.stream_depth:
+            self._depth_books[symbol] = {}
+            depth = self._ib.reqMktDepth(
+                contract,
+                numRows=self._settings.depth_rows,
+                isSmartDepth=True,
+            )
+            depth.updateEvent += self._make_depth_handler(symbol)
+            logger.info(
+                "ibkr.depth_subscribed",
+                symbol=symbol,
+                rows=self._settings.depth_rows,
+            )
+
         logger.info("ibkr.subscribed", symbol=symbol)
 
     async def unsubscribe(self, symbol: str) -> None:
         if symbol not in self._subscriptions:
             return
-        # ib_insync cancels realtime bars by the contract object
-        contract = self._subscriptions.pop(symbol)
-        # cancelRealTimeBars expects the bars object; we'd need to store it.
-        # For simplicity, disconnect/reconnect resets all subscriptions.
+        self._subscriptions.pop(symbol)
+        self._depth_books.pop(symbol, None)
         logger.info("ibkr.unsubscribed", symbol=symbol)
 
     def on_tick(self, callback: TickCallback) -> None:
-        self._callbacks.append(callback)
+        self._tick_callbacks.append(callback)
+
+    def on_quote(self, callback: QuoteCallback) -> None:
+        self._quote_callbacks.append(callback)
+
+    def on_depth_update(self, callback: DepthCallback) -> None:
+        self._depth_callbacks.append(callback)
 
     @property
     def is_connected(self) -> bool:
         return self._connected and self._ib.isConnected()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers — connection management
     # ------------------------------------------------------------------
 
     async def _try_once(self) -> bool:
-        """Single connection attempt. Returns True on success."""
         try:
             await self._ib.connectAsync(
                 self._settings.host,
@@ -165,7 +218,6 @@ class IBKRAdapter(MarketDataAdapter):
                 port=self._settings.port,
                 client_id=self._settings.client_id,
             )
-            # Re-subscribe on reconnect
             if self._subscriptions:
                 symbols = list(self._subscriptions.keys())
                 self._subscriptions.clear()
@@ -177,7 +229,6 @@ class IBKRAdapter(MarketDataAdapter):
             return False
 
     async def _retry_loop(self) -> None:
-        """Background task: retry with exponential back-off until connected."""
         for attempt, delay in enumerate(_RECONNECT_DELAYS, start=1):
             logger.info("ibkr.reconnect_wait", delay_s=delay, attempt=attempt)
             await asyncio.sleep(delay)
@@ -199,6 +250,15 @@ class IBKRAdapter(MarketDataAdapter):
         logger.warning("ibkr.unexpected_disconnect")
         self._start_retry_loop()
 
+    def _schedule(self, coro) -> None:  # type: ignore[no-untyped-def]
+        """Thread-safely schedule a coroutine on the main asyncio loop."""
+        if self._loop and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    # ------------------------------------------------------------------
+    # Internal helpers — event handlers
+    # ------------------------------------------------------------------
+
     def _make_bar_handler(self, symbol: str):
         """Return a closure that handles RealTimeBar events for *symbol*."""
 
@@ -208,7 +268,6 @@ class IBKRAdapter(MarketDataAdapter):
             bar = bars[-1]
             ts = _normalize_bar_time(bar.time)
             session = classify_session(ts)
-            # ib_insync may expose open as either open or open_
             open_price = getattr(bar, "open", getattr(bar, "open_", None))
             if open_price is None:
                 logger.warning("ibkr.bar_missing_open", symbol=symbol)
@@ -223,16 +282,107 @@ class IBKRAdapter(MarketDataAdapter):
                 volume=float(bar.volume),
                 session=session,
             )
-            if self._loop and not self._loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
-                    self._dispatch(tick), self._loop
-                )
+            self._schedule(self._dispatch_tick(tick))
 
         return handler
 
-    async def _dispatch(self, tick: Tick) -> None:
-        for cb in self._callbacks:
+    def _make_quote_handler(self, symbol: str):
+        """Return a closure that handles Ticker (L1 quote) update events."""
+
+        def handler(ticker: Ticker) -> None:
+            ts = datetime.now(tz=timezone.utc)
+            session = classify_session(ts)
+
+            bid = _safe_float(ticker.bid)
+            ask = _safe_float(ticker.ask)
+            bid_size = _safe_float(ticker.bidSize)
+            ask_size = _safe_float(ticker.askSize)
+
+            # Skip completely empty quote updates (ib_insync fires eagerly)
+            if bid is None and ask is None:
+                return
+
+            quote = QuoteSnapshot(
+                symbol=symbol,
+                timestamp=ts,
+                bid=bid,
+                ask=ask,
+                bid_size=bid_size,
+                ask_size=ask_size,
+                session=session,
+            )
+            self._schedule(self._dispatch_quote(quote))
+
+        return handler
+
+    def _make_depth_handler(self, symbol: str):
+        """
+        Return a closure that handles market-depth update events.
+
+        ib_insync fires depth updates as individual row changes
+        (operation=0 insert, 1 update, 2 delete; side=0 ask, 1 bid).
+        We maintain a running book dict and publish a full snapshot after
+        every update.
+        """
+
+        def handler(ticker: Ticker, side: int, op: int, row: int,
+                    price: float, size: float) -> None:
+            book = self._depth_books.get(symbol)
+            if book is None:
+                return
+
+            key = (side, row)
+            if op == 2:  # delete
+                book.pop(key, None)
+            else:         # insert or update
+                p = _safe_float(price)
+                s = _safe_float(size)
+                if p is not None and s is not None:
+                    book[key] = BookLevel(price=p, size=s)
+
+            # Rebuild sorted sides and publish snapshot
+            bids = sorted(
+                (v for (sd, _), v in book.items() if sd == 1),
+                key=lambda lv: lv.price,
+                reverse=True,  # best bid first
+            )
+            asks = sorted(
+                (v for (sd, _), v in book.items() if sd == 0),
+                key=lambda lv: lv.price,  # best ask first
+            )
+            ts = datetime.now(tz=timezone.utc)
+            snapshot = OrderBookSnapshot(
+                symbol=symbol,
+                timestamp=ts,
+                bids=bids,
+                asks=asks,
+                session=classify_session(ts),
+            )
+            self._schedule(self._dispatch_depth(snapshot))
+
+        return handler
+
+    # ------------------------------------------------------------------
+    # Async dispatchers
+    # ------------------------------------------------------------------
+
+    async def _dispatch_tick(self, tick: Tick) -> None:
+        for cb in self._tick_callbacks:
             try:
                 await cb(tick)
             except Exception:
-                logger.exception("ibkr.callback_error", symbol=tick.symbol)
+                logger.exception("ibkr.tick_callback_error", symbol=tick.symbol)
+
+    async def _dispatch_quote(self, quote: QuoteSnapshot) -> None:
+        for cb in self._quote_callbacks:
+            try:
+                await cb(quote)
+            except Exception:
+                logger.exception("ibkr.quote_callback_error", symbol=quote.symbol)
+
+    async def _dispatch_depth(self, snap: OrderBookSnapshot) -> None:
+        for cb in self._depth_callbacks:
+            try:
+                await cb(snap)
+            except Exception:
+                logger.exception("ibkr.depth_callback_error", symbol=snap.symbol)

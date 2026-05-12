@@ -1,7 +1,7 @@
 """
 QQQ VWAP Reclaim Long strategy.
 
-Setup logic (all conditions must be true on the same bar):
+Primary trigger (candle + context layer — unchanged):
 1. Price was below VWAP at the prior bar close.
 2. Current bar closes above VWAP (reclaim).
 3. Strong close: close is in the upper half of the bar (close > midpoint).
@@ -9,6 +9,16 @@ Setup logic (all conditions must be true on the same bar):
 5. Not overextended: distance from VWAP is within a reasonable range.
 6. RTH session only.
 7. Opening range must be established (OR window complete).
+
+Microstructure confirmation layer (optional, applied when available):
+A signal that passes all primary checks is additionally vetted against
+the latest MicrostructureSnapshot for the same symbol.  When microstructure
+data is absent the confirmation step is skipped (fail-open, not fail-closed).
+
+Rejection conditions (microstructure):
+  - spread_reject:     spread_pct > max_spread_pct (liquidity too thin)
+  - pressure_reject:   quote_pressure < min_quote_pressure (sellers dominant)
+  - pull_reject:       liquidity_pull=True (fast bid cancel detected)
 
 Risk parameters:
 - Stop: candle low (with a configurable buffer in ticks).
@@ -27,6 +37,7 @@ import structlog
 from packages.core.models import (
     Candle,
     MarketContext,
+    MicrostructureSnapshot,
     SessionType,
     SetupSignal,
     SignalDirection,
@@ -39,7 +50,8 @@ logger = structlog.get_logger(__name__)
 
 class VWAPReclaimLong(Strategy):
     """
-    Long entry on a clean VWAP reclaim with volume and price structure confirmation.
+    Long entry on a clean VWAP reclaim with volume and price structure
+    confirmation.  Microstructure is used as an optional veto layer.
 
     Designed primarily for QQQ (1-minute timeframe) but symbol-agnostic.
     """
@@ -54,6 +66,10 @@ class VWAPReclaimLong(Strategy):
         stop_buffer_pct: float = 0.05,
         min_rr: float = 2.0,
         timeframe: Timeframe = Timeframe.MIN_1,
+        # ── Microstructure thresholds ─────────────────────────────────
+        max_spread_pct: float = 0.05,        # reject if spread > 5 bp
+        min_quote_pressure: float = -0.1,    # reject if smoothed pressure < -0.1
+        use_microstructure: bool = True,     # set False to disable entirely
     ) -> None:
         self._symbol = symbol
         self._min_rvol = min_rvol
@@ -61,11 +77,13 @@ class VWAPReclaimLong(Strategy):
         self._stop_buffer_pct = stop_buffer_pct
         self._min_rr = min_rr
         self._timeframe = timeframe
+        self._max_spread_pct = max_spread_pct
+        self._min_quote_pressure = min_quote_pressure
+        self._use_microstructure = use_microstructure
 
         # Rolling state
-        self._last_above_vwap: Optional[bool] = None
-        self._pending_context: Optional[MarketContext] = None
         self._last_candle: Optional[Candle] = None
+        self._pending_context: Optional[MarketContext] = None
 
     @property
     def strategy_id(self) -> str:
@@ -77,24 +95,34 @@ class VWAPReclaimLong(Strategy):
         self._last_candle = candle
         return None  # Signal generation is triggered by context update
 
-    async def on_context_update(self, context: MarketContext) -> Optional[SetupSignal]:
+    async def on_context_update(
+        self,
+        context: MarketContext,
+        microstructure: Optional[MicrostructureSnapshot] = None,
+    ) -> Optional[SetupSignal]:
         if context.symbol != self._symbol:
             return None
 
         self._pending_context = context
 
-        # We need a paired candle
         if self._last_candle is None:
             return None
 
-        return self._evaluate(self._last_candle, context)
+        return self._evaluate(self._last_candle, context, microstructure)
+
+    # ------------------------------------------------------------------
+    # Internal evaluation
+    # ------------------------------------------------------------------
 
     def _evaluate(
-        self, candle: Candle, ctx: MarketContext
+        self,
+        candle: Candle,
+        ctx: MarketContext,
+        micro: Optional[MicrostructureSnapshot],
     ) -> Optional[SetupSignal]:
         """Apply all entry conditions and return a signal or None."""
 
-        # --- Gate conditions (hard filters) ---
+        # ── Primary gate conditions (hard filters) ────────────────────
 
         if candle.session != SessionType.RTH:
             return None
@@ -104,11 +132,9 @@ class VWAPReclaimLong(Strategy):
 
         ind = ctx.indicators
 
-        # Opening range must be locked (30 min window complete)
         if ind.opening_range_high is None or ind.opening_range_low is None:
             return None
 
-        # Must be a VWAP reclaim: was below, now above
         if not ctx.vwap_cross_up:
             return None
 
@@ -116,7 +142,6 @@ class VWAPReclaimLong(Strategy):
         if vwap is None or vwap <= 0:
             return None
 
-        # Strong close: close must be in the upper half of the candle
         bar_range = candle.high - candle.low
         if bar_range <= 0:
             return None
@@ -124,17 +149,30 @@ class VWAPReclaimLong(Strategy):
         if close_position < 0.5:
             return None
 
-        # Volume confirmation
         rvol = ind.relative_volume
         if rvol is None or rvol < self._min_rvol:
             return None
 
-        # Not overextended from VWAP
         vwap_dist = ind.vwap_distance_pct
         if vwap_dist is None or vwap_dist > self._max_vwap_distance_pct:
             return None
 
-        # --- Risk levels ---
+        # ── Microstructure confirmation (optional veto) ───────────────
+
+        micro_veto, veto_reason = self._microstructure_veto(micro)
+        if micro_veto:
+            logger.debug(
+                "vwap_reclaim.micro_veto",
+                symbol=self._symbol,
+                reason=veto_reason,
+                spread_pct=micro.spread_pct if micro else None,
+                quote_pressure=micro.quote_pressure if micro else None,
+                liquidity_pull=micro.liquidity_pull if micro else None,
+            )
+            return None
+
+        # ── Risk levels ───────────────────────────────────────────────
+
         stop = candle.low * (1.0 - self._stop_buffer_pct / 100.0)
         risk = candle.close - stop
         if risk <= 0:
@@ -143,8 +181,22 @@ class VWAPReclaimLong(Strategy):
         target = candle.close + risk * self._min_rr
         rr = (target - candle.close) / risk
 
-        # Confidence: simple heuristic based on rvol and close quality
         confidence = min(1.0, (rvol / 2.0) * close_position)
+
+        # Boost confidence slightly when microstructure is positive
+        if micro is not None and self._use_microstructure:
+            if micro.quote_pressure is not None and micro.quote_pressure > 0.1:
+                confidence = min(1.0, confidence * 1.1)
+
+        micro_note = ""
+        if micro is not None:
+            micro_note = (
+                f" | spread={micro.spread_pct:.3f}% "
+                f"| pressure={micro.quote_pressure:.3f}"
+                f"| pull={micro.liquidity_pull}"
+            ) if (
+                micro.spread_pct is not None and micro.quote_pressure is not None
+            ) else ""
 
         signal = SetupSignal(
             strategy_id=self.STRATEGY_ID,
@@ -160,6 +212,7 @@ class VWAPReclaimLong(Strategy):
             notes=(
                 f"VWAP reclaim @ {candle.close:.2f} | VWAP={vwap:.2f} | "
                 f"rvol={rvol:.2f}x | close_qual={close_position:.0%}"
+                f"{micro_note}"
             ),
             context_snapshot=ctx,
         )
@@ -174,3 +227,34 @@ class VWAPReclaimLong(Strategy):
             confidence=signal.confidence,
         )
         return signal
+
+    def _microstructure_veto(
+        self, micro: Optional[MicrostructureSnapshot]
+    ) -> tuple[bool, str]:
+        """
+        Return (should_veto, reason).
+
+        Fail-open: if microstructure is disabled or unavailable, never veto.
+        """
+        if not self._use_microstructure or micro is None:
+            return False, ""
+
+        # Spread too wide — liquidity thin, slippage risk
+        if (
+            micro.spread_pct is not None
+            and micro.spread_pct > self._max_spread_pct
+        ):
+            return True, f"spread_wide={micro.spread_pct:.4f}%>{self._max_spread_pct}%"
+
+        # Quote pressure negative — sellers dominating the L1 order flow
+        if (
+            micro.quote_pressure is not None
+            and micro.quote_pressure < self._min_quote_pressure
+        ):
+            return True, f"pressure_negative={micro.quote_pressure:.4f}<{self._min_quote_pressure}"
+
+        # Liquidity pull — best bid just got yanked, fragile support
+        if micro.liquidity_pull:
+            return True, "liquidity_pull=True"
+
+        return False, ""
